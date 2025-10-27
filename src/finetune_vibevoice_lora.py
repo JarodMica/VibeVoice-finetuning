@@ -1,8 +1,11 @@
 # train_vibevoice_lora.py
 import logging
 import os
+import re
+import shutil
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -18,6 +21,11 @@ from transformers import (
 from transformers import TrainingArguments as HfTrainingArguments
 
 from peft import LoraConfig, get_peft_model, TaskType
+
+try:
+    import safetensors.torch as st  # type: ignore
+except Exception:  # pragma: no cover
+    st = None
 
 from vibevoice.modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
@@ -602,6 +610,116 @@ def main() -> None:
             except Exception as e:
                 logger.warning(f"LoRA debug (on_step_end) failed: {e}")
 
+
+    def _load_lora_assets(model: VibeVoiceForConditionalGeneration, checkpoint_dir: str) -> bool:
+        if not os.path.isdir(checkpoint_dir):
+            return False
+
+        lora_dir = os.path.join(checkpoint_dir, "lora")
+        if not os.path.isdir(lora_dir):
+            return False
+
+        loaded_any = False
+
+        llm = getattr(model.model, "language_model", None)
+        if llm is not None:
+            adapter_state = None
+            adapter_safe = os.path.join(lora_dir, "adapter_model.safetensors")
+            adapter_bin = os.path.join(lora_dir, "adapter_model.bin")
+            try:
+                if 'st' in globals() and st is not None and os.path.exists(adapter_safe):
+                    adapter_state = st.load_file(adapter_safe, device="cpu")
+                elif os.path.exists(adapter_bin):
+                    adapter_state = torch.load(adapter_bin, map_location="cpu")
+                if adapter_state is not None:
+                    missing, unexpected = llm.load_state_dict(adapter_state, strict=False)
+                    logger.info(
+                        "Loaded LoRA adapter from %s (missing=%d, unexpected=%d)",
+                        lora_dir,
+                        len(missing),
+                        len(unexpected),
+                    )
+                    loaded_any = True
+            except Exception as exc:
+                logger.warning("Failed to load LoRA adapter from %s: %s", lora_dir, exc)
+
+        pred_head = getattr(model.model, "prediction_head", None)
+        if pred_head is not None:
+            diff_bin = os.path.join(lora_dir, "diffusion_head_full.bin")
+            if os.path.exists(diff_bin):
+                try:
+                    diff_state = torch.load(diff_bin, map_location="cpu")
+                    missing, unexpected = pred_head.load_state_dict(diff_state, strict=False)
+                    logger.info(
+                        "Loaded diffusion head weights from %s (missing=%d, unexpected=%d)",
+                        diff_bin,
+                        len(missing),
+                        len(unexpected),
+                    )
+                    loaded_any = True
+                except Exception as exc:
+                    logger.warning("Failed to load diffusion head weights from %s: %s", diff_bin, exc)
+
+        ac_conn = getattr(model.model, "acoustic_connector", None)
+        if ac_conn is not None:
+            ac_dir = os.path.join(lora_dir, "acoustic_connector")
+            ac_path = os.path.join(ac_dir, "pytorch_model.bin")
+            if os.path.exists(ac_path):
+                try:
+                    ac_state = torch.load(ac_path, map_location="cpu")
+                    missing, unexpected = ac_conn.load_state_dict(ac_state, strict=False)
+                    logger.info(
+                        "Loaded acoustic connector weights from %s (missing=%d, unexpected=%d)",
+                        ac_path,
+                        len(missing),
+                        len(unexpected),
+                    )
+                    loaded_any = True
+                except Exception as exc:
+                    logger.warning("Failed to load acoustic connector weights from %s: %s", ac_path, exc)
+
+        se_conn = getattr(model.model, "semantic_connector", None)
+        if se_conn is not None:
+            se_dir = os.path.join(lora_dir, "semantic_connector")
+            se_path = os.path.join(se_dir, "pytorch_model.bin")
+            if os.path.exists(se_path):
+                try:
+                    se_state = torch.load(se_path, map_location="cpu")
+                    missing, unexpected = se_conn.load_state_dict(se_state, strict=False)
+                    logger.info(
+                        "Loaded semantic connector weights from %s (missing=%d, unexpected=%d)",
+                        se_path,
+                        len(missing),
+                        len(unexpected),
+                    )
+                    loaded_any = True
+                except Exception as exc:
+                    logger.warning("Failed to load semantic connector weights from %s: %s", se_path, exc)
+
+        return loaded_any
+
+    def _prune_checkpoints(output_dir: str, keep: int) -> None:
+        if keep <= 0:
+            return
+        base_path = Path(output_dir)
+        if not base_path.exists():
+            return
+        checkpoints = []
+        for ckpt in base_path.iterdir():
+            if ckpt.is_dir() and ckpt.name.startswith("checkpoint-"):
+                match = re.match(r"checkpoint-(\d+)$", ckpt.name)
+                if match:
+                    checkpoints.append((int(match.group(1)), ckpt))
+        if len(checkpoints) <= keep:
+            return
+        checkpoints.sort(key=lambda x: x[0])
+        for _, ckpt_dir in checkpoints[:-keep]:
+            try:
+                shutil.rmtree(ckpt_dir, ignore_errors=True)
+                logger.info("Removed old checkpoint %s", ckpt_dir)
+            except Exception as exc:
+                logger.warning("Failed to remove checkpoint %s: %s", ckpt_dir, exc)
+
     class VibeVoiceTrainer(Trainer):
         def compute_loss(self, model: VibeVoiceForConditionalGeneration, inputs: Dict[str, Any], return_outputs=False, num_items_in_batch: Optional[int] = None):
             labels = inputs.get("input_ids")
@@ -734,23 +852,28 @@ def main() -> None:
   
 
         def _save(self, output_dir: Optional[str] = None, state_dict=None) -> None:
+            target_dir = output_dir or self.args.output_dir
             try:
-                target_dir = output_dir or self.args.output_dir
+                super()._save(target_dir, state_dict=state_dict)
+            except Exception as exc:
+                logger.warning("Standard checkpoint save failed: %s", exc)
+
+            try:
                 lora_out = os.path.join(target_dir, "lora")
                 os.makedirs(lora_out, exist_ok=True)
-    
+
                 # --- LLM PEFT adapters (if LoRA-wrapped) ---
                 language_model = getattr(self.model.model, "language_model", None)
                 if hasattr(language_model, "save_pretrained"):
                     language_model.save_pretrained(lora_out)
-    
+
                 # --- Diffusion head PEFT adapters (if LoRA-wrapped) ---
                 pred_head = getattr(self.model.model, "prediction_head", None)
                 if hasattr(pred_head, "save_pretrained"):
                     ph_dir = os.path.join(lora_out, "diffusion_head")
                     os.makedirs(ph_dir, exist_ok=True)
                     pred_head.save_pretrained(ph_dir)
-    
+
                 # --- ALWAYS save FULL diffusion head state_dict for fallback ---
                 if pred_head is not None and hasattr(pred_head, "state_dict"):
                     sd = pred_head.state_dict()
@@ -758,23 +881,26 @@ def main() -> None:
                     ph_dir = os.path.join(lora_out, "diffusion_head")
                     os.makedirs(ph_dir, exist_ok=True)
                     torch.save(sd, os.path.join(ph_dir, "diffusion_head_full.bin"))
-    
+
                 # --- Connectors (plain state_dicts) ---
                 ac = getattr(self.model.model, "acoustic_connector", None)
                 if ac is not None:
                     ac_dir = os.path.join(lora_out, "acoustic_connector")
                     os.makedirs(ac_dir, exist_ok=True)
                     torch.save(ac.state_dict(), os.path.join(ac_dir, "pytorch_model.bin"))
-    
+
                 se = getattr(self.model.model, "semantic_connector", None)
                 if se is not None:
                     se_dir = os.path.join(lora_out, "semantic_connector")
                     os.makedirs(se_dir, exist_ok=True)
                     torch.save(se.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
-    
+
             except Exception as e:
                 logger.warning(f"Failed to save LoRA assets: {e}")
 
+            limit = training_args.save_total_limit if training_args.save_total_limit is not None else 5
+            if limit is not None and limit > 0:
+                _prune_checkpoints(training_args.output_dir, int(limit))
 
     # ------------- Build the Trainer -------------
 
@@ -846,6 +972,34 @@ def main() -> None:
         except Exception:
             logger.warning("Failed to enable gradient checkpointing on the model.")
 
+    resume_path = training_args.resume_from_checkpoint
+    if resume_path:
+        has_index = any(
+            os.path.exists(os.path.join(resume_path, fn))
+            for fn in (
+                "pytorch_model.bin",
+                "pytorch_model.bin.index.json",
+                "model.safetensors",
+                "model.safetensors.index.json",
+            )
+        )
+        if not has_index:
+            if _load_lora_assets(model, resume_path):
+                logger.info(
+                    "Loaded LoRA assets from %s; optimizer state missing so training restarts from step 0.",
+                    resume_path,
+                )
+                training_args.resume_from_checkpoint = None
+            else:
+                logger.warning(
+                    "resume_from_checkpoint='%s' lacks standard checkpoint files; starting fresh run.",
+                    resume_path,
+                )
+                training_args.resume_from_checkpoint = None
+    elif os.path.isdir(os.path.join(training_args.output_dir, "lora")):
+        if _load_lora_assets(model, training_args.output_dir):
+            logger.info("Initialized model from existing LoRA assets in %s", training_args.output_dir)
+
     if training_args.do_train:
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     
@@ -893,6 +1047,9 @@ def main() -> None:
                 torch.save(se.state_dict(), os.path.join(se_dir, "pytorch_model.bin"))
         except Exception as e:
             logger.warning(f"Failed to save semantic_connector: {e}")
+        limit = training_args.save_total_limit if training_args.save_total_limit is not None else 5
+        if limit is not None and limit > 0:
+            _prune_checkpoints(training_args.output_dir, int(limit))
 
     if training_args.do_eval and eval_dataset is not None:
         trainer.evaluate()

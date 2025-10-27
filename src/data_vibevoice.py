@@ -216,6 +216,13 @@ class VibeVoiceCollator:
             attn_extended.append(1)
             acoustic_input_mask.append(False)
             acoustic_loss_mask.append(False)
+            
+            # FIXED: Add actual EOS token after speech_end_id to properly terminate generation
+            eos_token_id = self.processor.tokenizer.eos_token_id
+            ids_extended.append(eos_token_id)
+            attn_extended.append(1)
+            acoustic_input_mask.append(False)
+            acoustic_loss_mask.append(False)
 
             if self.max_length is not None and len(ids_extended) > self.max_length:
                 cut = len(ids_extended) - int(self.max_length)

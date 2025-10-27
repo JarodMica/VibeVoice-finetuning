@@ -3,13 +3,13 @@ name = "vibevoice-finetuning"
 version = "0.1.0"
 description = "Open Source finetuning code for VibeVoice"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 license = {file = "LICENSE"}
 authors = [
     {name = "jpgallegoarvpb", email = "juanpablo.gallego@voicepowered.ai"}
 ]
 dependencies = [
-    "numpy~=1.26.0",
+    "numpy<=1.26.0",
     "resampy==0.4.3",
     "librosa==0.11.0",
     "s3tokenizer",
@@ -24,12 +24,36 @@ dependencies = [
     "safetensors==0.5.3",
     "peft>=0.11.0",
     "tensorboard>=2.12",
-    "wandb"
+    "wandb",
+    "transformers==4.51.3"
 ]
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+cu128 = [
+  "torch>=2.7.1",
+  "torchvision>=0.22.1",
+  "torchaudio>=2.7.1"
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu128", extra = "cu128" },
+]
+torchvision = [
+  { index = "pytorch-cu128", extra = "cu128" },
+]
+torchaudio = [
+  { index = "pytorch-cu128", extra = "cu128" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
